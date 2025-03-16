@@ -1,0 +1,205 @@
+# -*- coding: utf-8 -*-
+import cv2 as cv
+import numpy as np
+import rospy
+from cv_bridge import CvBridge
+from geometry_msgs.msg import Twist
+
+# 定义空函数，防止函数异常
+def nothing(*arg):
+    pass
+
+class UcarOpencv:
+    def __init__(self):
+        rospy.init_node('ucar_opencv', anonymous=True)
+        self.publisher_cmd = rospy.Publisher('/car_cmd_vel', Twist, queue_size=10)
+        self.rate = rospy.Rate(10)  # 10Hz
+        self.cmd_vel = Twist()
+        self.cmd_vel.linear.x = 1.0  # 设置默认线速度
+        self.cmd_vel.angular.z = 0.0  # 设置默认角速度
+        self.Lower_White = np.array([0, 0, 200])  # 白色车道线的 HSV 下限
+        self.Upper_White = np.array([180, 30, 255])  # 白色车道线的 HSV 上限
+        self.kp = 0.5  # 比例控制系数
+        self.cap = cv.VideoCapture(0)  # 初始化摄像头
+        if not self.cap.isOpened():
+            rospy.logerr('无法接收帧，退出...')
+            exit(1)
+
+    def mask_white(self, frame):
+        """生成白色车道线的掩模"""
+        frame_blur = cv.GaussianBlur(frame, (7, 7), 0)  # 高斯滤波
+        hsv = cv.cvtColor(frame_blur, cv.COLOR_BGR2HSV)  # 转换为 HSV 颜色空间
+        white_mask = cv.inRange(hsv, self.Lower_White, self.Upper_White)  # 生成白色掩模
+        kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (7, 7))  # 形态学核
+        white_mask = cv.morphologyEx(white_mask, cv.MORPH_CLOSE, kernel)  # 闭运算
+        white_mask = cv.morphologyEx(white_mask, cv.MORPH_OPEN, kernel)  # 开运算
+        return white_mask
+
+    def sliding_window(self, binary_warped, nwindows=9, margin=100, minpix=50):
+        """滑动窗口法检测车道线"""
+        # 获取图像下半部分的直方图
+        histogram = np.sum(binary_warped[binary_warped.shape[0] // 2:, :], axis=0)#沿列方向求和
+        #沿深度方向(第三个维度)堆叠数组，将二值图像转化为三通道彩色图像
+        out_img = np.dstack((binary_warped, binary_warped, binary_warped)) * 255
+
+        # 找到左右车道线的起点
+        midpoint = np.int(histogram.shape[0] // 2)
+        leftx_base = np.argmax(histogram[:midpoint])#左侧车道线的起始索引
+        rightx_base = np.argmax(histogram[midpoint:]) + midpoint#右侧车道线的起始索引
+
+        # 设置滑动窗口的高度
+        window_height = np.int(binary_warped.shape[0] // nwindows)
+        # 获取非零像素的 x 和 y 坐标
+        nonzero = binary_warped.nonzero()#返回二值图像所有非零点像素坐标
+        nonzeroy = np.array(nonzero[0])#y坐标
+        nonzerox = np.array(nonzero[1])#x坐标
+        # 初始化左右车道线的像素索引
+        leftx_current = leftx_base
+        rightx_current = rightx_base
+        left_lane_inds = []
+        right_lane_inds = []
+
+        # 遍历每个窗口
+        for window in range(nwindows):
+            # 确定窗口的边界
+            win_y_low = binary_warped.shape[0] - (window + 1) * window_height
+            win_y_high = binary_warped.shape[0] - window * window_height
+            win_xleft_low = leftx_current - margin
+            win_xleft_high = leftx_current + margin
+            win_xright_low = rightx_current - margin
+            win_xright_high = rightx_current + margin
+
+            # 绘制窗口
+            cv.rectangle(out_img, (win_xleft_low, win_y_low), (win_xleft_high, win_y_high), (0, 255, 0), 2)
+            cv.rectangle(out_img, (win_xright_low, win_y_low), (win_xright_high, win_y_high), (0, 255, 0), 2)
+
+            # 识别窗口内的非零像素
+            good_left_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) &
+                             (nonzerox >= win_xleft_low) & (nonzerox < win_xleft_high)).nonzero()[0]
+            good_right_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) &
+                              (nonzerox >= win_xright_low) & (nonzerox < win_xright_high)).nonzero()[0]
+
+            # 将检测到的像素添加到列表中
+            left_lane_inds.append(good_left_inds)
+            right_lane_inds.append(good_right_inds)
+
+            # 如果找到的像素数量大于 minpix，则更新窗口中心
+            if len(good_left_inds) > minpix:
+                leftx_current = np.int(np.mean(nonzerox[good_left_inds]))
+            if len(good_right_inds) > minpix:
+                rightx_current = np.int(np.mean(nonzerox[good_right_inds]))
+
+        # 合并左右车道线的像素索引
+        #合成为一个一维数组
+        left_lane_inds = np.concatenate(left_lane_inds)
+        right_lane_inds = np.concatenate(right_lane_inds)
+
+        # 提取左右车道线的像素坐标
+        leftx = nonzerox[left_lane_inds]
+        lefty = nonzeroy[left_lane_inds]
+        rightx = nonzerox[right_lane_inds]
+        righty = nonzeroy[right_lane_inds]
+
+        # 判断是否检测到左右车道线
+        if len(leftx) == 0 and len(rightx) == 0:
+            rospy.logwarn("未检测到车道线，停止小车")
+            return None, None, out_img
+        elif len(leftx) == 0:
+            rospy.logwarn("只检测到右侧车道线，假设左侧车道线平行")
+            # 根据右侧车道线拟合左侧车道线
+            right_fit = np.polyfit(righty, rightx, 2)
+            left_fit = right_fit.copy()
+            left_fit[2] -= 500  # 假设车道宽度为 500 像素
+        elif len(rightx) == 0:
+            rospy.logwarn("只检测到左侧车道线，假设右侧车道线平行")
+            # 根据左侧车道线拟合右侧车道线
+            left_fit = np.polyfit(lefty, leftx, 2)
+            right_fit = left_fit.copy()
+            right_fit[2] += 500  # 假设车道宽度为 500 像素
+        else:
+            # 正常情况，拟合左右车道线
+            left_fit = np.polyfit(lefty, leftx, 2)
+            right_fit = np.polyfit(righty, rightx, 2)
+
+        return left_fit, right_fit, out_img
+
+def calculate_angle_deviation(self, left_fit, right_fit, img_width):
+    """计算中线与图像中心线的角度偏差，支持单侧车道线"""
+    if left_fit is None or right_fit is None:
+        rospy.logwarn("未检测到车道线，停止小车")
+        return 0.0  # 返回 0 偏差，停止小车
+
+    # 计算中线的斜率
+    y = img_width // 2
+    if left_fit is not None:
+        left_x = left_fit[0] * y ** 2 + left_fit[1] * y + left_fit[2]
+    else:
+        left_x = right_fit[0] * y ** 2 + right_fit[1] * y + right_fit[2] - 420  # 以车道宽度进行坐标平移
+
+    if right_fit is not None:
+        right_x = right_fit[0] * y ** 2 + right_fit[1] * y + right_fit[2]
+    else:
+        right_x = left_fit[0] * y ** 2 + left_fit[1] * y + left_fit[2] + 420  # 以车道宽度进行坐标平移
+
+    mid_x = (left_x + right_x) / 2
+    # 计算斜率对应的角度（弧度）
+    angle = np.arctan2(img_width // 2 - mid_x, img_width)
+    # 计算角度偏差
+    angle_deviation = angle
+    return angle_deviation
+
+    # def calculate_angle_deviation(self, left_fit, right_fit, img_width):
+    #     """计算中线与图像中心线的角度偏差"""
+    #     # 计算中线的斜率
+    #     y = img_width // 2
+    #     left_x = left_fit[0] * y ** 2 + left_fit[1] * y + left_fit[2]
+    #     right_x = right_fit[0] * y ** 2 + right_fit[1] * y + right_fit[2]
+    #     mid_x = (left_x + right_x) / 2
+    #     # 计算斜率对应的角度（弧度）
+    #     angle = np.arctan2(img_width // 2 - mid_x, img_width)
+    #     # 计算角度偏差
+    #     angle_deviation = angle
+    #     return angle_deviation
+
+    def control_car(self, angle_deviation):
+        """根据角度偏差调整车辆方向"""
+        self.cmd_vel.angular.z = -self.kp * angle_deviation  # 比例控制
+
+    def run(self):
+        """主循环"""
+        while not rospy.is_shutdown():
+            ret, frame = self.cap.read()
+            if not ret:
+                rospy.logerr('无法接收帧，退出...')
+                break
+
+            # 生成白色车道线掩模
+            white_mask = self.mask_white(frame)
+            # 使用滑动窗口法检测车道线
+            left_fit, right_fit, out_img = self.sliding_window(white_mask)
+            # 计算角度偏差
+            angle_deviation = self.calculate_angle_deviation(left_fit, right_fit, frame.shape[1])
+            # 控制小车
+            self.control_car(angle_deviation)
+            # 发布速度指令
+            self.publisher_cmd.publish(self.cmd_vel)
+            rospy.loginfo(f"发布速度命令: linear.x={self.cmd_vel.linear.x}, angular.z={self.cmd_vel.angular.z}")
+
+            # 显示结果
+            cv.imshow('Original', frame)
+            cv.imshow('Lane Detection', out_img)
+            if cv.waitKey(1) & 0xFF == ord('q'):
+                break
+
+            self.rate.sleep()
+
+        self.cap.release()
+        cv.destroyAllWindows()
+
+# 设置标准入口点
+if __name__ == '__main__':
+    try:
+        node = UcarOpencv()
+        node.run()
+    except rospy.ROSInterruptException:
+        pass
