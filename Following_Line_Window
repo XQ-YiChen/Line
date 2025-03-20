@@ -12,21 +12,20 @@ def nothing(*arg):
 class UcarOpencv:
     def __init__(self):
         rospy.init_node('ucar_opencv', anonymous=True)
-        self.publisher_cmd = rospy.Publisher('/car_cmd_vel', Twist, queue_size=10)
+        self.publisher_cmd = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
         self.rate = rospy.Rate(10)  # 10Hz
         self.cmd_vel = Twist()
-        self.cmd_vel.linear.x = 1.0  # 设置默认线速度
+        self.cmd_vel.linear.x = 0.3  # 设置默认线速度
         self.cmd_vel.angular.z = 0.0  # 设置默认角速度
-        self.Lower_White = np.array([0, 0, 200])  # 白色车道线的 HSV 下限
-        self.Upper_White = np.array([180, 30, 255])  # 白色车道线的 HSV 上限
-        self.kp = 0.5  # 比例控制系数
+        self.Lower_White = np.array([25, 7, 224])  # 白色车道线的 HSV 下限
+        self.Upper_White = np.array([180, 255, 255])  # 白色车道线的 HSV 上限
+        self.kp = 0.8 # 比例控制系数
         self.cap = cv.VideoCapture(0)  # 初始化摄像头
         if not self.cap.isOpened():
-            rospy.logerr('无法接收帧，退出...')
+            rospy.logerr('can not recive frame,Exiting...')
             exit(1)
 
     def mask_white(self, frame):
-        """生成白色车道线的掩模"""
         frame_blur = cv.GaussianBlur(frame, (7, 7), 0)  # 高斯滤波
         hsv = cv.cvtColor(frame_blur, cv.COLOR_BGR2HSV)  # 转换为 HSV 颜色空间
         white_mask = cv.inRange(hsv, self.Lower_White, self.Upper_White)  # 生成白色掩模
@@ -36,7 +35,6 @@ class UcarOpencv:
         return white_mask
 
     def sliding_window(self, binary_warped, nwindows=9, margin=100, minpix=50):
-        """滑动窗口法检测车道线"""
         # 获取图像下半部分的直方图
         histogram = np.sum(binary_warped[binary_warped.shape[0] // 2:, :], axis=0)#沿列方向求和
         #沿深度方向(第三个维度)堆叠数组，将二值图像转化为三通道彩色图像
@@ -102,75 +100,62 @@ class UcarOpencv:
 
         # 判断是否检测到左右车道线
         if len(leftx) == 0 and len(rightx) == 0:
-            rospy.logwarn("未检测到车道线，停止小车")
+            rospy.logwarn("No lane markings are detected, stop the car")
             return None, None, out_img
         elif len(leftx) == 0:
-            rospy.logwarn("只检测到右侧车道线，假设左侧车道线平行")
+            rospy.logwarn("Only the right lane lines are detected, assuming the left lane lines are parallel")
             # 根据右侧车道线拟合左侧车道线
             right_fit = np.polyfit(righty, rightx, 2)
             left_fit = right_fit.copy()
-            left_fit[2] -= 500  # 假设车道宽度为 500 像素
+            left_fit[2] -= 420  # 假设车道宽度为 500 像素
         elif len(rightx) == 0:
-            rospy.logwarn("只检测到左侧车道线，假设右侧车道线平行")
+            rospy.logwarn("Only the left lane line is detected, assuming the right lane line is parallel")
             # 根据左侧车道线拟合右侧车道线
             left_fit = np.polyfit(lefty, leftx, 2)
             right_fit = left_fit.copy()
-            right_fit[2] += 500  # 假设车道宽度为 500 像素
+            right_fit[2] += 420  # 假设车道宽度为 420 像素
         else:
             # 正常情况，拟合左右车道线
             left_fit = np.polyfit(lefty, leftx, 2)
             right_fit = np.polyfit(righty, rightx, 2)
 
         return left_fit, right_fit, out_img
-
-def calculate_angle_deviation(self, left_fit, right_fit, img_width):
-    """计算中线与图像中心线的角度偏差，支持单侧车道线"""
-    if left_fit is None or right_fit is None:
-        rospy.logwarn("未检测到车道线，停止小车")
-        return 0.0  # 返回 0 偏差，停止小车
-
-    # 计算中线的斜率
-    y = img_width // 2
-    if left_fit is not None:
-        left_x = left_fit[0] * y ** 2 + left_fit[1] * y + left_fit[2]
-    else:
-        left_x = right_fit[0] * y ** 2 + right_fit[1] * y + right_fit[2] - 420  # 以车道宽度进行坐标平移
-
-    if right_fit is not None:
-        right_x = right_fit[0] * y ** 2 + right_fit[1] * y + right_fit[2]
-    else:
-        right_x = left_fit[0] * y ** 2 + left_fit[1] * y + left_fit[2] + 420  # 以车道宽度进行坐标平移
-
-    mid_x = (left_x + right_x) / 2
-    # 计算斜率对应的角度（弧度）
-    angle = np.arctan2(img_width // 2 - mid_x, img_width)
-    # 计算角度偏差
-    angle_deviation = angle
-    return angle_deviation
-
-    # def calculate_angle_deviation(self, left_fit, right_fit, img_width):
-    #     """计算中线与图像中心线的角度偏差"""
-    #     # 计算中线的斜率
-    #     y = img_width // 2
-    #     left_x = left_fit[0] * y ** 2 + left_fit[1] * y + left_fit[2]
-    #     right_x = right_fit[0] * y ** 2 + right_fit[1] * y + right_fit[2]
-    #     mid_x = (left_x + right_x) / 2
-    #     # 计算斜率对应的角度（弧度）
-    #     angle = np.arctan2(img_width // 2 - mid_x, img_width)
-    #     # 计算角度偏差
-    #     angle_deviation = angle
-    #     return angle_deviation
-
+    
     def control_car(self, angle_deviation):
-        """根据角度偏差调整车辆方向"""
-        self.cmd_vel.angular.z = -self.kp * angle_deviation  # 比例控制
+        self.cmd_vel.angular.z = self.kp * angle_deviation  # 比例控制
+        
+    def calculate_angle_deviation(self, left_fit, right_fit, img_width):
+        if left_fit is None or right_fit is None:
+            rospy.logwarn("No lane markings are detected, stop the car")
+            return 0.0  # 返回 0 偏差，停止小车
+
+        # 计算中线的斜率
+        y = img_width // 2
+        if left_fit is not None:
+            left_x = left_fit[0] * y ** 2 + left_fit[1] * y + left_fit[2]
+        else:
+            left_x = right_fit[0] * y ** 2 + right_fit[1] * y + right_fit[2] - 420  # 以车道宽度进行坐标平移
+
+        if right_fit is not None:
+            right_x = right_fit[0] * y ** 2 + right_fit[1] * y + right_fit[2]
+        else:
+            right_x = left_fit[0] * y ** 2 + left_fit[1] * y + left_fit[2] + 420  # 以车道宽度进行坐标平移
+
+        mid_x = (left_x + right_x) / 2
+        # 计算斜率对应的角度（弧度）
+        angle = np.arctan2(img_width // 2 - mid_x, img_width)
+        # 计算角度偏差
+        angle_deviation = angle
+        return angle_deviation
+
+
 
     def run(self):
-        """主循环"""
+ 
         while not rospy.is_shutdown():
             ret, frame = self.cap.read()
             if not ret:
-                rospy.logerr('无法接收帧，退出...')
+                rospy.logerr('can not recive frame,Exiting...')
                 break
 
             # 生成白色车道线掩模
@@ -183,7 +168,7 @@ def calculate_angle_deviation(self, left_fit, right_fit, img_width):
             self.control_car(angle_deviation)
             # 发布速度指令
             self.publisher_cmd.publish(self.cmd_vel)
-            rospy.loginfo(f"发布速度命令: linear.x={self.cmd_vel.linear.x}, angular.z={self.cmd_vel.angular.z}")
+            rospy.loginfo(f"cmd_vel: linear.x={self.cmd_vel.linear.x}, angular.z={self.cmd_vel.angular.z}")
 
             # 显示结果
             cv.imshow('Original', frame)
@@ -195,6 +180,7 @@ def calculate_angle_deviation(self, left_fit, right_fit, img_width):
 
         self.cap.release()
         cv.destroyAllWindows()
+    
 
 # 设置标准入口点
 if __name__ == '__main__':
@@ -203,3 +189,4 @@ if __name__ == '__main__':
         node.run()
     except rospy.ROSInterruptException:
         pass
+    
