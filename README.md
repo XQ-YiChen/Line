@@ -1,2 +1,2 @@
-# Line
-This is an Opencv-Python code
+# 基于OPENCV的巡线代码
+本项目中，包含了基于OPENCV的HSV色度空间转换阈值的调试代码，以及基于滑动窗口算法的视觉巡线识别以及对智能车实现速度控制的的python代码。
